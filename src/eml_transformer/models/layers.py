@@ -5,6 +5,25 @@ to test whether a learned head can recover EML subtree depth from an RPN
 sequence — a minimal architecture keeps that question clean. No dropout,
 no bias terms on linear layers (a modern small-LM convention), no
 torch.compile for the first proof-of-life.
+
+Effort-conditioning mechanisms
+------------------------------
+Three modulation modes are supported via the ``ffn_mode`` choice on
+``ModelConfig``:
+
+* ``"vanilla"``   — no effort input; standard GELU FFN.
+* ``"delta"``     — Gemini's original construction: ``fixed(x) + e * delta(x)``.
+                    Duplicates the FFN (2× params) to give the model a second
+                    pathway that scales linearly with effort.
+* ``"film"``      — feature-wise linear modulation (Perez et al. 2018). A tiny
+                    generator turns the scalar effort into per-channel γ and β
+                    that scale and shift the FFN's hidden activations before
+                    the non-linearity. Adds ``~2 * (d_model * expansion)``
+                    params per layer plus a small MLP — far less than ``delta``
+                    but with more expressive per-channel routing.
+
+FiLM is the conventional choice in the literature. ``delta`` is kept as an
+ablation so we can actually measure which construction helps (if any).
 """
 
 from __future__ import annotations
@@ -18,9 +37,9 @@ from torch import Tensor
 class RotaryEmbedding(nn.Module):
     """Rotary positional embeddings for Q/K (Su et al. 2021).
 
-    We precompute cos/sin tables up to `max_seq_len` and register them as
-    non-persistent buffers so they move with `.to(device)` but don't bloat
-    the checkpoint. The `base` constant (10000) matches the GPT-NeoX /
+    We precompute cos/sin tables up to ``max_seq_len`` and register them as
+    non-persistent buffers so they move with ``.to(device)`` but don't bloat
+    the checkpoint. The ``base`` constant (10000) matches the GPT-NeoX /
     LLaMA convention.
     """
 
@@ -65,7 +84,7 @@ class CausalSelfAttention(nn.Module):
     """Multi-head causal self-attention using torch's fused SDPA kernel.
 
     The padding mask from the dataset is fused with the causal mask into a
-    single additive bias. We don't use `is_causal=True` because combining it
+    single additive bias. We don't use ``is_causal=True`` because combining it
     with a per-batch key-padding mask isn't supported in all PyTorch 2.x
     builds — constructing the full bias is reliable and negligible cost at
     this model size.
@@ -119,7 +138,11 @@ class CausalSelfAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    """Position-wise GELU FFN. Standard 4x expansion ratio."""
+    """Position-wise GELU FFN. Standard 4x expansion ratio.
+
+    Signature supports an optional ``effort`` argument for interface symmetry
+    with the modulated variants, but ignores it.
+    """
 
     def __init__(self, d_model: int, expansion: int = 4) -> None:
         super().__init__()
@@ -127,17 +150,17 @@ class FeedForward(nn.Module):
         self.fc_in = nn.Linear(d_model, hidden, bias=False)
         self.fc_out = nn.Linear(hidden, d_model, bias=False)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor, effort: Tensor | None = None) -> Tensor:  # noqa: ARG002
         return self.fc_out(F.gelu(self.fc_in(x)))
 
 
-class SelfAwareFFN(nn.Module):
-    """Modulated FFN: W = W_fixed + effort * ΔW.
+class DeltaFFN(nn.Module):
+    """Duplicated-FFN modulation: ``fixed(x) + effort * delta(x)``.
 
-    In the linear case without bias, this is equivalent to:
-    out = FFN_fixed(x) + effort * FFN_delta(x)
-
-    This allows the model to 'turn on' more parameters as tree depth increases.
+    This is the original construction from the first Phase-2 attempt. It's
+    kept as an ablation target: fair comparisons should report it alongside
+    FiLM to measure whether modulation helps more than the extra parameters.
+    Note this doubles the FFN parameter count vs vanilla.
     """
 
     def __init__(self, d_model: int, expansion: int = 4) -> None:
@@ -145,23 +168,98 @@ class SelfAwareFFN(nn.Module):
         self.fixed = FeedForward(d_model, expansion)
         self.delta = FeedForward(d_model, expansion)
 
-    def forward(self, x: Tensor, effort: Tensor) -> Tensor:
-        """Forward pass.
-
-        Args:
-            x: (batch, seq_len, d_model) input.
-            effort: (batch, seq_len, 1) per-token scalar effort.
-
-        Returns:
-            (batch, seq_len, d_model) output.
-        """
+    def forward(self, x: Tensor, effort: Tensor | None = None) -> Tensor:
         f_out = self.fixed(x)
+        if effort is None:
+            return f_out
         d_out = self.delta(x)
         return f_out + effort * d_out
 
 
+class FiLMFFN(nn.Module):
+    """Feature-wise Linear Modulation FFN (Perez et al. 2018).
+
+    A single linear layer turns the scalar effort into per-channel ``(γ, β)``
+    that modulate the hidden activations between ``fc_in`` and the GELU
+    non-linearity::
+
+        h = fc_in(x)
+        γ, β = linear(effort).chunk(2, dim=-1)
+        h = (1 + γ) * h + β
+        h = gelu(h)
+        out = fc_out(h)
+
+    The ``1 +`` initialization on γ means that at init (zero effort, zero γ-bias)
+    the layer behaves as a plain FFN — so a frozen-evaluator run with untrained
+    effort signal degrades gracefully to vanilla. Applying modulation *before*
+    the non-linearity is what lets a linear parameterization compose into a
+    nonlinear change downstream, which is the key insight from the original
+    FiLM retrospective.
+
+    Parameter cost per layer: ``d_model * 2 * hidden`` for the generator,
+    compared to ``DeltaFFN``'s duplicate ``~2 * 4 * d_model^2``. For ``d_model=128``
+    and ``expansion=4``: FiLM adds ~1K generator params; Delta adds ~130K.
+    """
+
+    def __init__(self, d_model: int, expansion: int = 4, effort_dim: int = 1) -> None:
+        super().__init__()
+        hidden = d_model * expansion
+        self.fc_in = nn.Linear(d_model, hidden, bias=False)
+        self.fc_out = nn.Linear(hidden, d_model, bias=False)
+        # Generator: effort scalar -> (γ, β) concatenated along last dim.
+        self.film_gen = nn.Linear(effort_dim, 2 * hidden, bias=True)
+        # Tag the generator so the decoder's global ``_init_weights`` pass
+        # doesn't overwrite the zero init below. See the FiLM retrospective's
+        # note on regularization-at-init: large γ/β at init destabilize
+        # training. Zero init means the layer begins as a plain FFN and
+        # learns modulation from scratch.
+        self.film_gen._is_film_gen = True  # type: ignore[attr-defined]
+        nn.init.zeros_(self.film_gen.weight)
+        nn.init.zeros_(self.film_gen.bias)
+        self.hidden = hidden
+
+    def forward(self, x: Tensor, effort: Tensor | None = None) -> Tensor:
+        """Forward pass with FiLM modulation.
+
+        Args:
+            x: (batch, seq_len, d_model) input.
+            effort: (batch, seq_len, 1) per-token effort. If ``None``, the layer
+                computes a plain FFN (γ=0, β=0), matching ``FeedForward`` exactly.
+
+        Returns:
+            (batch, seq_len, d_model) output.
+        """
+        h = self.fc_in(x)
+        if effort is not None:
+            params = self.film_gen(effort)  # (B, T, 2 * hidden)
+            gamma, beta = params.chunk(2, dim=-1)  # each (B, T, hidden)
+            h = (1.0 + gamma) * h + beta
+        h = F.gelu(h)
+        return self.fc_out(h)
+
+
+def make_ffn(d_model: int, mode: str, expansion: int = 4) -> nn.Module:
+    """Factory for the FFN variants. Keeps DecoderLayer mode-agnostic."""
+    if mode == "vanilla":
+        return FeedForward(d_model, expansion)
+    if mode == "delta":
+        return DeltaFFN(d_model, expansion)
+    if mode == "film":
+        return FiLMFFN(d_model, expansion)
+    raise ValueError(f"unknown ffn_mode {mode!r}; expected vanilla|delta|film")
+
+
+# Backward-compat alias: the pre-refactor Phase-2 name for DeltaFFN. Tests
+# and external callers that import ``SelfAwareFFN`` keep working.
+SelfAwareFFN = DeltaFFN
+
+
 class DecoderLayer(nn.Module):
-    """Pre-norm transformer decoder layer with optional effort modulation."""
+    """Pre-norm transformer decoder layer with optional effort modulation.
+
+    The FFN is chosen by ``ffn_mode``. All three variants accept the same
+    ``(x, effort)`` signature, so the layer's forward is mode-agnostic.
+    """
 
     def __init__(
         self,
@@ -169,17 +267,15 @@ class DecoderLayer(nn.Module):
         n_heads: int,
         max_seq_len: int,
         eps: float = 1e-5,
-        self_aware: bool = False,
+        ffn_mode: str = "vanilla",
+        ffn_expansion: int = 4,
     ) -> None:
         super().__init__()
+        self.ffn_mode = ffn_mode
         self.norm_attn = nn.RMSNorm(d_model, eps=eps)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len)
         self.norm_ffn = nn.RMSNorm(d_model, eps=eps)
-
-        if self_aware:
-            self.ffn = SelfAwareFFN(d_model)
-        else:
-            self.ffn = FeedForward(d_model)
+        self.ffn = make_ffn(d_model, ffn_mode, expansion=ffn_expansion)
 
     def forward(
         self,
@@ -187,27 +283,8 @@ class DecoderLayer(nn.Module):
         key_padding_mask: Tensor | None = None,
         effort: Tensor | None = None,
     ) -> Tensor:
-        """Forward pass.
-
-        Args:
-            x: Input tensor.
-            key_padding_mask: Padding mask.
-            effort: (batch, seq_len, 1) effort scalar. If None and the layer
-                is self_aware, it defaults to effort=0.0.
-        """
         x = x + self.attn(self.norm_attn(x), key_padding_mask=key_padding_mask)
-
-        x_norm = self.norm_ffn(x)
-        if isinstance(self.ffn, SelfAwareFFN):
-            if effort is None:
-                # Default to base (fixed) behavior if no effort provided
-                effort = torch.zeros(
-                    x.shape[:-1] + (1,), device=x.device, dtype=x.dtype
-                )
-            x = x + self.ffn(x_norm, effort)
-        else:
-            x = x + self.ffn(x_norm)
-
+        x = x + self.ffn(self.norm_ffn(x), effort)
         return x
 
 

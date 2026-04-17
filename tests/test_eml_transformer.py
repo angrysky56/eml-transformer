@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from eml_transformer.models.decoder import ModelConfig, TinyDecoder
+from eml_transformer.models.decoder import ModelConfig, TinyDecoder, make_config
 from eml_transformer.models.effort_head import EffortHead
 from eml_transformer.models.self_aware import EMLTransformer
 
@@ -14,7 +14,7 @@ def test_eml_transformer_forward():
     eval_head = EffortHead(d_model=32, num_bins=6)
 
     # 2. Setup main decoder (self-aware)
-    main_config = ModelConfig(
+    main_config = make_config(
         vocab_size=10, d_model=32, n_heads=2, n_layers=2, self_aware=True
     )
     main_decoder = TinyDecoder(main_config)

@@ -1,11 +1,18 @@
-"""Small decoder-only transformer body for the Effort Evaluator.
+"""Small decoder-only transformer body.
 
-This module defines `TinyDecoder` — a stack of RMSNorm + causal self-attention
-+ FFN layers that maps token IDs to per-position hidden states. The effort
-regression head in `effort_head.py` consumes those hidden states.
+The decoder body is shared between two roles:
 
-Configuration is a plain dataclass with sensible defaults for a ~500K
-parameter model that trains in under a minute on a single RTX 3060.
+* **Effort Evaluator** — a decoder + ``EffortHead`` trained to predict
+  per-token subtree depth on EML RPN sequences.
+* **Main decoder** — the downstream model whose FFNs can be modulated by
+  the evaluator's effort signal (via ``ffn_mode="film"`` or ``"delta"``).
+
+``ModelConfig`` carries all the knobs. The evaluator only needs
+``num_bins`` to size its classification head, and the main decoder only
+needs ``ffn_mode`` to pick its FFN variant — the *other* field is inert
+for the *other* role, which is intentional. Splitting them into two
+dataclasses would require extra boilerplate without reducing confusion
+once a reader knows which role they're configuring.
 """
 
 from __future__ import annotations
@@ -18,12 +25,33 @@ from torch import Tensor
 from eml_transformer.models.layers import DecoderLayer
 
 
+VALID_FFN_MODES: tuple[str, ...] = ("vanilla", "delta", "film")
+
+
 @dataclass(frozen=True)
 class ModelConfig:
     """Configuration for the tiny decoder.
 
-    Defaults target the proof-of-life setting: ~500K parameters trainable
-    on a 12 GB GPU with batch size 64 in well under a minute per 4k steps.
+    Defaults target a ~800K-parameter evaluator suitable for the proof-of-life
+    experiment. For main decoders that consume effort, set ``ffn_mode``.
+
+    Args:
+        vocab_size: Size of the tokenizer's output alphabet.
+        d_model: Hidden dimension.
+        n_heads: Number of attention heads; must divide ``d_model``.
+        n_layers: Number of transformer layers.
+        max_seq_len: Maximum sequence length for rotary embeddings.
+        rms_eps: RMSNorm epsilon.
+        ffn_mode: FFN variant. ``vanilla`` ignores effort; ``delta`` duplicates
+            the FFN; ``film`` applies FiLM modulation.
+        ffn_expansion: Expansion ratio for FFN hidden dim. Use this to
+            parameter-match ``vanilla`` against ``delta`` or ``film``
+            (e.g. expansion=6 brings vanilla closer to a delta model at 4).
+        num_bins: Only used by the evaluator role (for EffortHead). Irrelevant
+            to main-decoder roles. Default 6 covers EML depths 0..5.
+
+    Backward compatibility: the old ``self_aware: bool`` flag is accepted via
+    ``make_config(self_aware=True)`` and translated to ``ffn_mode="delta"``.
     """
 
     vocab_size: int = 8
@@ -32,8 +60,10 @@ class ModelConfig:
     n_layers: int = 4
     max_seq_len: int = 128
     rms_eps: float = 1e-5
-    self_aware: bool = False
-    num_bins: int = 6  # depth 0 to 5 by default
+    ffn_mode: str = "vanilla"
+    ffn_expansion: int = 4
+    num_bins: int = 6
+
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
@@ -42,15 +72,40 @@ class ModelConfig:
             )
         if self.max_seq_len < 1:
             raise ValueError("max_seq_len must be positive")
+        if self.ffn_mode not in VALID_FFN_MODES:
+            raise ValueError(
+                f"ffn_mode {self.ffn_mode!r} not in {VALID_FFN_MODES}"
+            )
+        if self.ffn_expansion < 1:
+            raise ValueError("ffn_expansion must be >= 1")
+        if self.num_bins < 2:
+            raise ValueError("num_bins must be >= 2")
+
+
+def _legacy_self_aware_config(**kwargs) -> dict:
+    """Translate a legacy ``self_aware=True/False`` kwarg into ``ffn_mode``.
+
+    Preserves the pre-refactor CLI / checkpoint surface. Quietly silences any
+    mention of ``self_aware`` after translation.
+    """
+    if "self_aware" in kwargs:
+        legacy = kwargs.pop("self_aware")
+        if legacy and kwargs.get("ffn_mode", "vanilla") == "vanilla":
+            kwargs["ffn_mode"] = "delta"
+    return kwargs
+
+
+def make_config(**kwargs) -> ModelConfig:
+    """Build a ``ModelConfig`` accepting both current and legacy kwargs."""
+    return ModelConfig(**_legacy_self_aware_config(**kwargs))
 
 
 class TinyDecoder(nn.Module):
     """Decoder-only transformer producing per-position hidden states.
 
-    No language-modeling head is attached here — the effort head is the
-    sole output of this phase, and we want the decoder body to be reusable
-    if later phases add auxiliary objectives (e.g., an LM head for joint
-    pretraining on mixed language + EML corpora).
+    No language-modeling head is attached here — a pluggable ``task_head``
+    lives on the composed ``EMLTransformer`` instead, so this class stays
+    usable as either evaluator body or main-decoder body.
     """
 
     def __init__(self, config: ModelConfig) -> None:
@@ -64,7 +119,8 @@ class TinyDecoder(nn.Module):
                     n_heads=config.n_heads,
                     max_seq_len=config.max_seq_len,
                     eps=config.rms_eps,
-                    self_aware=config.self_aware,
+                    ffn_mode=config.ffn_mode,
+                    ffn_expansion=config.ffn_expansion,
                 )
                 for _ in range(config.n_layers)
             ]
@@ -73,10 +129,21 @@ class TinyDecoder(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Small-model init: normal(std=0.02) for linears and embeddings."""
+        """Small-model init: normal(std=0.02) for linears and embeddings.
+
+        FiLM generators are initialized separately in ``FiLMFFN.__init__`` and
+        deliberately not overwritten here — FiLM layers need their γ/β
+        predictor to start at zero so the model degrades to vanilla at init.
+        """
         for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Embedding)):
+            if isinstance(module, nn.Embedding):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            elif isinstance(module, nn.Linear):
+                # Skip FiLM generators so their zero init survives.
+                if getattr(module, "_is_film_gen", False):
+                    continue
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
 
     def forward(
         self,
@@ -88,12 +155,9 @@ class TinyDecoder(nn.Module):
 
         Args:
             input_ids: (batch, seq_len) long tensor of token IDs.
-            attention_mask: (batch, seq_len) bool tensor with True for real
-                tokens and False for padding. Passed to each decoder layer.
-            effort: (batch, seq_len, 1) optional effort scalar tensor.
-
-        Returns:
-            (batch, seq_len, d_model) final hidden states.
+            attention_mask: (batch, seq_len) bool, True for real tokens.
+            effort: optional (batch, seq_len, 1) float tensor consumed by
+                modulated FFN variants. Ignored by vanilla FFNs.
         """
         if input_ids.size(1) > self.config.max_seq_len:
             raise ValueError(
@@ -106,4 +170,5 @@ class TinyDecoder(nn.Module):
         return self.final_norm(x)
 
     def num_parameters(self) -> int:
+        """Count of trainable parameters — useful for parameter-matched ablations."""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)

@@ -13,11 +13,13 @@ from eml_transformer.data.dataset import (
 from eml_transformer.data.tokenizer import EMLTokenizer
 from eml_transformer.data.trees import random_tree
 from eml_transformer.models import (
+    VALID_FFN_MODES,
     EffortHead,
     EMLTransformer,
     LMHead,
     ModelConfig,
     TinyDecoder,
+    make_config,
 )
 from eml_transformer.training import (
     GlobalMeanBaseline,
@@ -254,13 +256,16 @@ def _cmd_train_main(args: argparse.Namespace) -> int:
         collate_fn=lambda b: collate_effort_batch(b, tokenizer.pad_id),
     )
 
-    # 2. Model setup
-    main_config = ModelConfig(
+    # 2. Model setup. ``--ffn-mode`` is the modern flag; ``--no-self-aware``
+    # is kept as a deprecated alias that forces vanilla mode.
+    ffn_mode = "vanilla" if args.no_self_aware else args.ffn_mode
+    main_config = make_config(
         vocab_size=tokenizer.vocab_size,
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
-        self_aware=not args.no_self_aware,  # Allow disabling self-awareness
+        ffn_mode=ffn_mode,
+        ffn_expansion=args.ffn_expansion,
     )
 
     # Load EMLTransformer using the evaluator checkpoint
@@ -281,18 +286,73 @@ def _cmd_train_main(args: argparse.Namespace) -> int:
         verbose=True,
     )
 
-    print(f"Main Decoder parameters: {model.main_decoder.num_parameters():,}")
+    # Report trainable parameter count — this is the fair number to cite
+    # across modes because it excludes the frozen evaluator.
+    print(f"Config: ffn_mode={ffn_mode}, ffn_expansion={args.ffn_expansion}")
+    print(f"Trainable parameters: {model.num_trainable_parameters():,}")
     print(f"Starting Phase 2 training on {args.device}...")
     train_lm(model, train_loader, eval_loader, t_config)
 
     if args.save_path:
-        # We reuse save_checkpoint but we need to be careful about what we save.
-        # For now, let's just save the whole EMLTransformer state.
-        # Note: save_checkpoint expects (model, head, config, path)
-        # We'll pass model.task_head as the head.
         print(f"Saving main model checkpoint to {args.save_path}...")
         save_checkpoint(model, model.task_head, main_config, args.save_path)
 
+    return 0
+
+
+def _cmd_eval_depth(args: argparse.Namespace) -> int:
+    """Evaluate a trained Effort Evaluator on held-out deeper trees.
+
+    Trains nothing. Loads the model from ``--load-path`` and reports
+    per-``max-depth`` accuracy so we can see whether the learned depth
+    signal generalizes from the training distribution (typically
+    max_depth=5) to deeper, unseen trees (max_depth=6, 7, ...).
+
+    The random-tree generator's ``branch_schedule_depth`` is held fixed at
+    the training value, so shallow trees have the *same* distribution in
+    every eval bucket — we only change the cap.
+    """
+    tokenizer = EMLTokenizer.from_variables(DEFAULT_VARIABLES)
+
+    # Load checkpoint once to read the saved config (it tells us how to
+    # size the head and whether the model was trained at depth 5 or another).
+    ckpt = torch.load(args.load_path, map_location=args.device, weights_only=False)
+    saved_config = ckpt.get("config")
+    if isinstance(saved_config, dict):
+        saved_config = make_config(**saved_config)
+    if saved_config is None:
+        saved_config = ModelConfig()
+
+    model = TinyDecoder(saved_config)
+    head = EffortHead(d_model=saved_config.d_model, num_bins=saved_config.num_bins)
+    load_checkpoint(model, head, args.load_path, device=args.device)
+
+    # The schedule used at training time anchors the tree distribution. Any
+    # eval bucket with a larger cap draws trees from the same conditional
+    # distribution at shallow depths — only the tail extends.
+    branch_schedule = args.branch_schedule_depth
+
+    print(
+        f"Held-out depth evaluation"
+        f" | model num_bins={saved_config.num_bins}"
+        f" | branch_schedule_depth={branch_schedule}"
+    )
+    for eval_depth in args.eval_max_depths:
+        ds = EffortDataset(
+            tokenizer,
+            DEFAULT_VARIABLES,
+            args.eval_samples,
+            max_depth=eval_depth,
+            branch_schedule_depth=branch_schedule,
+            seed=args.seed,
+        )
+        loader = DataLoader(
+            ds,
+            batch_size=args.batch_size,
+            collate_fn=lambda b: collate_effort_batch(b, tokenizer.pad_id),
+        )
+        metrics = evaluate(model, head, loader, device=args.device)
+        pretty_print_metrics(metrics, prefix=f"max_depth={eval_depth}")
     return 0
 
 
@@ -313,33 +373,119 @@ def _cmd_eval_main(args: argparse.Namespace) -> int:
         collate_fn=lambda b: collate_effort_batch(b, tokenizer.pad_id),
     )
 
-    # 1. We need the config from the checkpoint to reconstruct the model correctly.
-    # However, our current EMLTransformer.from_checkpoints is a bit limited.
-    # Let's manually load for now to be safe.
+    # ``weights_only=False`` because we saved a ``ModelConfig`` dataclass —
+    # our own checkpoints only.
+    checkpoint = torch.load(args.load_path, map_location=args.device, weights_only=False)
+    raw_cfg = checkpoint["config"]
+    m_config = make_config(**raw_cfg) if isinstance(raw_cfg, dict) else raw_cfg
 
-    checkpoint = torch.load(args.load_path, map_location=args.device, weights_only=True)
-    m_config_data = checkpoint["config"]
-    m_config = (
-        ModelConfig(**m_config_data)
-        if isinstance(m_config_data, dict)
-        else m_config_data
-    )
-
-    # We need the evaluator too.
     print(f"Loading evaluator from {args.evaluator_path}...")
     model = EMLTransformer.from_checkpoints(
         evaluator_path=args.evaluator_path,
         main_config=m_config,
         device=args.device,
     )
-
-    # Add LMHead and load its weights
     model.task_head = LMHead(d_model=m_config.d_model, vocab_size=tokenizer.vocab_size)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     print(f"Evaluating main model on {args.device}...")
     acc = evaluate_lm(model, eval_loader, device=args.device)
     print(f"Main Decoder LM Accuracy: {acc:.2%}")
+    return 0
+
+
+    return 0
+
+
+def _cmd_compare_modes(args: argparse.Namespace) -> int:
+    """Parameter-matched ablation across FFN modes, averaged over seeds.
+
+    Runs training for each of ``--modes`` on identical data and the same list
+    of seeds. Prints a side-by-side summary with mean±std of final eval
+    accuracy and trainable parameter count. Use this instead of single-run
+    comparisons — the prior report's 0.23% gap was inside expected noise.
+
+    This runs the *Effort Evaluator* task (depth prediction on RPN sequences).
+    Comparing LM-task main-decoder modes would require a trained evaluator
+    first; run that loop manually via ``train-main`` with different modes.
+    """
+    tokenizer = EMLTokenizer.from_variables(DEFAULT_VARIABLES)
+
+    train_ds = EffortDataset(
+        tokenizer,
+        DEFAULT_VARIABLES,
+        args.train_samples,
+        max_depth=args.max_depth,
+        seed=args.seed,
+    )
+    eval_ds = EffortDataset(
+        tokenizer,
+        DEFAULT_VARIABLES,
+        args.eval_samples,
+        max_depth=args.max_depth,
+        seed=args.seed + 1,
+    )
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=lambda b: collate_effort_batch(b, tokenizer.pad_id),
+    )
+    eval_loader = DataLoader(
+        eval_ds,
+        batch_size=args.batch_size,
+        collate_fn=lambda b: collate_effort_batch(b, tokenizer.pad_id),
+    )
+
+    results: dict[str, dict[str, list[float] | int]] = {}
+    for mode in args.modes:
+        accs: list[float] = []
+        maes: list[float] = []
+        param_count = 0
+        for seed in args.seeds:
+            torch.manual_seed(seed)
+            cfg = make_config(
+                vocab_size=tokenizer.vocab_size,
+                d_model=args.d_model,
+                n_heads=args.n_heads,
+                n_layers=args.n_layers,
+                ffn_mode=mode,
+                ffn_expansion=args.ffn_expansion,
+                num_bins=args.max_depth + 1,
+            )
+            model = TinyDecoder(cfg)
+            head = EffortHead(d_model=cfg.d_model, num_bins=cfg.num_bins)
+            param_count = model.num_parameters() + sum(
+                p.numel() for p in head.parameters()
+            )
+            t_config = TrainConfig(
+                epochs=args.epochs,
+                lr=args.lr,
+                device=args.device,
+                verbose=False,
+            )
+            print(f"  [{mode} seed={seed}] training ({param_count:,} params)...")
+            train(model, head, train_loader, eval_loader, t_config)
+            metrics = evaluate(model, head, eval_loader, device=args.device)
+            accs.append(metrics.accuracy)
+            maes.append(metrics.mae)
+        results[mode] = {"accs": accs, "maes": maes, "params": param_count}
+
+    # Pretty summary.
+    print("\n=== compare-modes summary ===")
+    print(
+        f"{'mode':<10} {'params':>10}  {'acc_mean':>10} {'acc_std':>8} "
+        f"{'mae_mean':>10} {'mae_std':>8}"
+    )
+    for mode in args.modes:
+        r = results[mode]
+        accs = torch.tensor(r["accs"])  # type: ignore[arg-type]
+        maes = torch.tensor(r["maes"])  # type: ignore[arg-type]
+        print(
+            f"{mode:<10} {r['params']:>10,}  "
+            f"{accs.mean().item():>10.4%} {accs.std().item():>8.4%} "
+            f"{maes.mean().item():>10.4f} {maes.std().item():>8.4f}"
+        )
     return 0
 
 
@@ -481,6 +627,19 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable self-aware modulation (baseline).",
     )
+    train_main.add_argument(
+        "--ffn-mode",
+        type=str,
+        default="delta",
+        choices=list(VALID_FFN_MODES),
+        help="Modulation variant for main decoder FFNs. Overridden by --no-self-aware.",
+    )
+    train_main.add_argument(
+        "--ffn-expansion",
+        type=int,
+        default=4,
+        help="FFN expansion ratio. Raise for vanilla to parameter-match delta (try 6-7).",
+    )
     train_main.set_defaults(func=_cmd_train_main)
 
     # Subcommand: eval-main
@@ -498,7 +657,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to Effort Evaluator checkpoint.",
     )
     eval_main.add_argument(
-        "--eval_samples", type=int, default=1000, help="Evaluation samples."
+        "--eval-samples", type=int, default=1000, help="Evaluation samples."
     )
     eval_main.add_argument("--batch-size", type=int, default=64, help="Batch size.")
     eval_main.add_argument("--max-depth", type=int, default=5, help="Max tree depth.")
@@ -507,6 +666,69 @@ def build_parser() -> argparse.ArgumentParser:
     )
     eval_main.add_argument("--seed", type=int, default=42, help="Random seed.")
     eval_main.set_defaults(func=_cmd_eval_main)
+
+    # Subcommand: eval-depth — held-out generalization test for the evaluator.
+    eval_depth = subparsers.add_parser(
+        "eval-depth",
+        help="Evaluate a trained Effort Evaluator on held-out deeper trees.",
+    )
+    eval_depth.add_argument(
+        "--load-path", type=str, required=True, help="Path to evaluator checkpoint."
+    )
+    eval_depth.add_argument(
+        "--eval-samples", type=int, default=2000, help="Eval samples per depth bucket."
+    )
+    eval_depth.add_argument(
+        "--eval-max-depths",
+        type=int,
+        nargs="+",
+        default=[5, 6, 7],
+        help="Max-depth buckets to evaluate (e.g. 5 6 7).",
+    )
+    eval_depth.add_argument(
+        "--branch-schedule-depth",
+        type=int,
+        default=5,
+        help="Must match the training-time schedule, otherwise the distribution shifts.",
+    )
+    eval_depth.add_argument("--batch-size", type=int, default=64)
+    eval_depth.add_argument("--device", type=str, default="cpu")
+    eval_depth.add_argument("--seed", type=int, default=123)
+    eval_depth.set_defaults(func=_cmd_eval_depth)
+
+    # Subcommand: compare-modes — parameter-matched ablation over FFN modes.
+    compare = subparsers.add_parser(
+        "compare-modes",
+        help="Train multiple FFN modes over multiple seeds and report mean±std.",
+    )
+    compare.add_argument(
+        "--modes",
+        type=str,
+        nargs="+",
+        default=["vanilla", "delta", "film"],
+        choices=list(VALID_FFN_MODES),
+        help="FFN modes to compare (any subset of vanilla/delta/film).",
+    )
+    compare.add_argument(
+        "--seeds",
+        type=int,
+        nargs="+",
+        default=[0, 1, 2],
+        help="Seeds to run per mode (mean±std is over these).",
+    )
+    compare.add_argument("--train-samples", type=int, default=5000)
+    compare.add_argument("--eval-samples", type=int, default=1000)
+    compare.add_argument("--epochs", type=int, default=5)
+    compare.add_argument("--batch-size", type=int, default=64)
+    compare.add_argument("--lr", type=float, default=1e-3)
+    compare.add_argument("--d-model", type=int, default=128)
+    compare.add_argument("--n-heads", type=int, default=4)
+    compare.add_argument("--n-layers", type=int, default=4)
+    compare.add_argument("--max-depth", type=int, default=5)
+    compare.add_argument("--ffn-expansion", type=int, default=4)
+    compare.add_argument("--device", type=str, default="cpu")
+    compare.add_argument("--seed", type=int, default=42, help="Data seed (not run seed).")
+    compare.set_defaults(func=_cmd_compare_modes)
 
     return parser
 
