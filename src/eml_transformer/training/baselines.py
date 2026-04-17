@@ -38,7 +38,7 @@ class GlobalMeanBaseline:
     prediction: int = 0
 
     @classmethod
-    def fit(cls, loader: DataLoader) -> "GlobalMeanBaseline":
+    def fit(cls, loader: DataLoader) -> GlobalMeanBaseline:
         total = 0.0
         count = 0
         for batch in loader:
@@ -75,7 +75,7 @@ class TokenClassBaseline:
     variable_ids: tuple[int, ...] = field(default_factory=tuple)
 
     @classmethod
-    def fit(cls, loader: DataLoader, tokenizer: EMLTokenizer) -> "TokenClassBaseline":
+    def fit(cls, loader: DataLoader, tokenizer: EMLTokenizer) -> TokenClassBaseline:
         from eml_transformer.data.tokenizer import (
             CONST_ONE_TOKEN,
             EML_OPCODE_TOKEN,
@@ -87,7 +87,8 @@ class TokenClassBaseline:
         reserved = {tokenizer.token_to_id[t] for t in RESERVED_TOKENS}
         # Any non-reserved, non-E, non-const id is a variable.
         variable_ids = tuple(
-            i for i in range(tokenizer.vocab_size)
+            i
+            for i in range(tokenizer.vocab_size)
             if i not in reserved and i != eml_id and i != const_id
         )
 
@@ -98,9 +99,12 @@ class TokenClassBaseline:
             labels = batch["depth_labels"]
             valid = labels != DEPTH_IGNORE_INDEX
             e_mask = valid & (input_ids == eml_id)
-            leaf_mask = valid & ((input_ids == const_id) | torch.isin(
-                input_ids, torch.tensor(variable_ids, dtype=input_ids.dtype)
-            ))
+            leaf_mask = valid & (
+                (input_ids == const_id)
+                | torch.isin(
+                    input_ids, torch.tensor(variable_ids, dtype=input_ids.dtype)
+                )
+            )
             e_total += labels[e_mask].float().sum().item()
             e_count += int(e_mask.sum().item())
             leaf_total += labels[leaf_mask].float().sum().item()
@@ -127,7 +131,9 @@ class TokenClassBaseline:
         # Leaves: const_one or any variable.
         leaf_mask = input_ids == self.const_id
         if self.variable_ids:
-            var_tensor = torch.tensor(self.variable_ids, device=input_ids.device, dtype=input_ids.dtype)
+            var_tensor = torch.tensor(
+                self.variable_ids, device=input_ids.device, dtype=input_ids.dtype
+            )
             leaf_mask = leaf_mask | torch.isin(input_ids, var_tensor)
         preds[leaf_mask] = self.leaf_prediction
         return preds

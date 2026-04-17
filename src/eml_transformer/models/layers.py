@@ -9,8 +9,6 @@ torch.compile for the first proof-of-life.
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -133,17 +131,92 @@ class FeedForward(nn.Module):
         return self.fc_out(F.gelu(self.fc_in(x)))
 
 
-class DecoderLayer(nn.Module):
-    """Pre-norm transformer decoder layer: attention sublayer + FFN sublayer."""
+class SelfAwareFFN(nn.Module):
+    """Modulated FFN: W = W_fixed + effort * ΔW.
 
-    def __init__(self, d_model: int, n_heads: int, max_seq_len: int, eps: float = 1e-5) -> None:
+    In the linear case without bias, this is equivalent to:
+    out = FFN_fixed(x) + effort * FFN_delta(x)
+
+    This allows the model to 'turn on' more parameters as tree depth increases.
+    """
+
+    def __init__(self, d_model: int, expansion: int = 4) -> None:
+        super().__init__()
+        self.fixed = FeedForward(d_model, expansion)
+        self.delta = FeedForward(d_model, expansion)
+
+    def forward(self, x: Tensor, effort: Tensor) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x: (batch, seq_len, d_model) input.
+            effort: (batch, seq_len, 1) per-token scalar effort.
+
+        Returns:
+            (batch, seq_len, d_model) output.
+        """
+        f_out = self.fixed(x)
+        d_out = self.delta(x)
+        return f_out + effort * d_out
+
+
+class DecoderLayer(nn.Module):
+    """Pre-norm transformer decoder layer with optional effort modulation."""
+
+    def __init__(
+        self,
+        d_model: int,
+        n_heads: int,
+        max_seq_len: int,
+        eps: float = 1e-5,
+        self_aware: bool = False,
+    ) -> None:
         super().__init__()
         self.norm_attn = nn.RMSNorm(d_model, eps=eps)
         self.attn = CausalSelfAttention(d_model, n_heads, max_seq_len)
         self.norm_ffn = nn.RMSNorm(d_model, eps=eps)
-        self.ffn = FeedForward(d_model)
 
-    def forward(self, x: Tensor, key_padding_mask: Tensor | None = None) -> Tensor:
+        if self_aware:
+            self.ffn = SelfAwareFFN(d_model)
+        else:
+            self.ffn = FeedForward(d_model)
+
+    def forward(
+        self,
+        x: Tensor,
+        key_padding_mask: Tensor | None = None,
+        effort: Tensor | None = None,
+    ) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x: Input tensor.
+            key_padding_mask: Padding mask.
+            effort: (batch, seq_len, 1) effort scalar. If None and the layer
+                is self_aware, it defaults to effort=0.0.
+        """
         x = x + self.attn(self.norm_attn(x), key_padding_mask=key_padding_mask)
-        x = x + self.ffn(self.norm_ffn(x))
+
+        x_norm = self.norm_ffn(x)
+        if isinstance(self.ffn, SelfAwareFFN):
+            if effort is None:
+                # Default to base (fixed) behavior if no effort provided
+                effort = torch.zeros(
+                    x.shape[:-1] + (1,), device=x.device, dtype=x.dtype
+                )
+            x = x + self.ffn(x_norm, effort)
+        else:
+            x = x + self.ffn(x_norm)
+
         return x
+
+
+class LMHead(nn.Module):
+    """Simple linear head mapping hidden states to vocabulary logits."""
+
+    def __init__(self, d_model: int, vocab_size: int) -> None:
+        super().__init__()
+        self.classifier = nn.Linear(d_model, vocab_size, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.classifier(x)

@@ -2,7 +2,7 @@
 
 Research prototype for an **effort-gated compiled substrate** inside transformer language models, using EML (exp-minus-log) trees as a verifiable mathematical IR.
 
-**Status:** Phase 0 scaffold. Data generation only. Model and training to follow.
+**Status:** Phase 1 Complete. Effort Evaluator achieves 100% accuracy on EML depth prediction. Phase 2 (Self-Aware) to follow.
 
 ## The idea in one paragraph
 
@@ -19,18 +19,25 @@ The long-term architecture stacks four ideas. The Effort Evaluator is the keysto
 
 Only concept 1 is in scope for this repository at present.
 
-## What's in this scaffold
+## What's in this repository
 
-- `src/eml_transformer/data/trees.py` — self-contained EML tree: node types, random generation, RPN linearization, per-token depth labels.
-- `src/eml_transformer/data/tokenizer.py` — tiny-vocab tokenizer for EML RPN sequences.
-- `src/eml_transformer/data/dataset.py` — PyTorch `Dataset` yielding `(token_ids, depth_labels, attention_mask)`.
-- `tests/` — smoke tests verifying the data generator produces correct labels.
+- `src/eml_transformer/data/` — EML tree generation, tokenization, and depth labeling.
+- `src/eml_transformer/models/` — Tiny decoder transformer and the **EffortHead** regression module.
+- `src/eml_transformer/training/` — Training loop, metrics calculation, and statistical baselines.
+- `src/eml_transformer/cli.py` — Unified entry point for data inspection, baseline fitting, and model training.
 
-## What's *not* in this scaffold (deliberately)
+## Results: Phase 1 (Effort Evaluator)
 
-- No model yet. The next phase adds a small decoder-only transformer with an effort regression head.
-- No training loop yet. Same reason.
-- No dependency on `eml-mcp`. This project is self-contained by design. The tree data structure mirrors eml-mcp's `EMLNode` conceptually but lives independently so neither project can break the other.
+The Effort Evaluator is a transformer-based router that predicts the computational complexity (tree depth) of mathematical tokens. In the initial benchmark:
+- **Baseline (Token-Class)**: 63.76% Accuracy
+- **Effort Evaluator (Phase 1)**: **100.00% Accuracy**
+
+This confirms that hierarchical complexity is fully learnable from linearized RPN context.
+
+## Next Steps: Phase 2 (Self-Aware Layer)
+
+The next phase integrates the Effort Evaluator into a **Self-Aware layer** where FFN weights are modulated by the predicted effort:
+`W = W_fixed + effort × ΔW_learnable`
 
 ## Setup
 

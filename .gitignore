@@ -33,6 +33,8 @@ htmlcov/
 # Data / checkpoints (may be large)
 data/
 checkpoints/
+*.pt
+*.pth
 wandb/
 runs/
 

@@ -6,8 +6,10 @@ from eml_transformer.models.layers import (
     CausalSelfAttention,
     DecoderLayer,
     FeedForward,
+    LMHead,
     RotaryEmbedding,
 )
+from eml_transformer.models.self_aware import EMLTransformer
 
 __all__ = [
     "ModelConfig",
@@ -16,5 +18,7 @@ __all__ = [
     "CausalSelfAttention",
     "DecoderLayer",
     "FeedForward",
+    "LMHead",
     "RotaryEmbedding",
+    "EMLTransformer",
 ]

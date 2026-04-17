@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import torch
 import torch.nn as nn
 from torch import Tensor
 
@@ -33,6 +32,8 @@ class ModelConfig:
     n_layers: int = 4
     max_seq_len: int = 128
     rms_eps: float = 1e-5
+    self_aware: bool = False
+    num_bins: int = 6  # depth 0 to 5 by default
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
@@ -63,6 +64,7 @@ class TinyDecoder(nn.Module):
                     n_heads=config.n_heads,
                     max_seq_len=config.max_seq_len,
                     eps=config.rms_eps,
+                    self_aware=config.self_aware,
                 )
                 for _ in range(config.n_layers)
             ]
@@ -73,15 +75,14 @@ class TinyDecoder(nn.Module):
     def _init_weights(self) -> None:
         """Small-model init: normal(std=0.02) for linears and embeddings."""
         for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            elif isinstance(module, nn.Embedding):
+            if isinstance(module, (nn.Linear, nn.Embedding)):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(
         self,
         input_ids: Tensor,
         attention_mask: Tensor | None = None,
+        effort: Tensor | None = None,
     ) -> Tensor:
         """Forward pass producing hidden states.
 
@@ -89,6 +90,7 @@ class TinyDecoder(nn.Module):
             input_ids: (batch, seq_len) long tensor of token IDs.
             attention_mask: (batch, seq_len) bool tensor with True for real
                 tokens and False for padding. Passed to each decoder layer.
+            effort: (batch, seq_len, 1) optional effort scalar tensor.
 
         Returns:
             (batch, seq_len, d_model) final hidden states.
@@ -100,7 +102,7 @@ class TinyDecoder(nn.Module):
             )
         x = self.embed(input_ids)
         for layer in self.layers:
-            x = layer(x, key_padding_mask=attention_mask)
+            x = layer(x, key_padding_mask=attention_mask, effort=effort)
         return self.final_norm(x)
 
     def num_parameters(self) -> int:

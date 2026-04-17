@@ -37,6 +37,9 @@ def compute_metrics(preds: Tensor, targets: Tensor) -> DepthMetrics:
     `preds` can be (B, T) discrete predictions or raw values; they will be
     compared directly to targets.
     """
+    if preds.shape != targets.shape:
+        raise ValueError(f"Shape mismatch: preds {preds.shape} vs targets {targets.shape}")
+
     valid_mask = targets != DEPTH_IGNORE_INDEX
     valid_preds = preds[valid_mask].float()
     valid_targets = targets[valid_mask].float()
