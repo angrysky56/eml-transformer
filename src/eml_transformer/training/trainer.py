@@ -11,6 +11,10 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
+from eml_transformer.models.decoder import ModelConfig
+
+torch.serialization.add_safe_globals([ModelConfig])
+
 from eml_transformer.data.dataset import DEPTH_IGNORE_INDEX
 from eml_transformer.training.metrics import compute_metrics, pretty_print_metrics
 
@@ -211,5 +215,7 @@ def load_checkpoint(
     checkpoint = torch.load(path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     head.load_state_dict(checkpoint["head_state_dict"])
-    print(f"Checkpoint loaded from {path}")
+    model.to(device)
+    head.to(device)
+    print(f"Checkpoint loaded from {path} (moved to {device})")
     return checkpoint.get("config")

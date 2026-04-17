@@ -111,8 +111,8 @@ class CausalSelfAttention(nn.Module):
         Returns:
             (batch, seq_len, d_model) output tensor.
         """
-        B, T, D = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim)
+        batch_size, seq_len, d_model = x.shape
+        qkv = self.qkv(x).view(batch_size, seq_len, 3, self.n_heads, self.head_dim)
         q, k, v = qkv.unbind(dim=2)  # each (B, T, H, Hd)
         q = q.transpose(1, 2)  # (B, H, T, Hd)
         k = k.transpose(1, 2)
@@ -121,19 +121,19 @@ class CausalSelfAttention(nn.Module):
 
         # Build combined (causal + padding) additive bias in float dtype.
         causal = torch.triu(
-            torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device), diagonal=1
         )
         if key_padding_mask is not None:
             pad_cols = ~key_padding_mask  # (B, T) True = pad column to mask
-            # Broadcast to (B, 1, T, T) so every query row masks the same pad keys.
+            # Broadcast to (batch_size, 1, seq_len, seq_len) so every query row masks the same pad keys.
             mask_bool = causal[None, None, :, :] | pad_cols[:, None, None, :]
         else:
-            mask_bool = causal[None, None, :, :].expand(B, 1, T, T)
+            mask_bool = causal[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
         bias = torch.zeros(mask_bool.shape, dtype=q.dtype, device=x.device)
         bias.masked_fill_(mask_bool, float("-inf"))
 
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=bias)
-        out = out.transpose(1, 2).contiguous().view(B, T, D)
+        out = out.transpose(1, 2).contiguous().view(batch_size, seq_len, d_model)
         return self.proj(out)
 
 
@@ -150,7 +150,9 @@ class FeedForward(nn.Module):
         self.fc_in = nn.Linear(d_model, hidden, bias=False)
         self.fc_out = nn.Linear(hidden, d_model, bias=False)
 
-    def forward(self, x: Tensor, effort: Tensor | None = None) -> Tensor:  # noqa: ARG002
+    def forward(self, x: Tensor, effort: Tensor | None = None) -> Tensor:
+        """Forward pass. Effort is ignored."""
+        # noqa: ARG002
         return self.fc_out(F.gelu(self.fc_in(x)))
 
 
@@ -169,6 +171,7 @@ class DeltaFFN(nn.Module):
         self.delta = FeedForward(d_model, expansion)
 
     def forward(self, x: Tensor, effort: Tensor | None = None) -> Tensor:
+        """Forward pass: weighted sum of fixed and delta branches."""
         f_out = self.fixed(x)
         if effort is None:
             return f_out
@@ -283,6 +286,7 @@ class DecoderLayer(nn.Module):
         key_padding_mask: Tensor | None = None,
         effort: Tensor | None = None,
     ) -> Tensor:
+        """Forward pass with residual connections."""
         x = x + self.attn(self.norm_attn(x), key_padding_mask=key_padding_mask)
         x = x + self.ffn(self.norm_ffn(x), effort)
         return x
@@ -296,4 +300,5 @@ class LMHead(nn.Module):
         self.classifier = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, x: Tensor) -> Tensor:
+        """Forward pass: hidden -> logits."""
         return self.classifier(x)

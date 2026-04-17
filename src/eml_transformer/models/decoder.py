@@ -19,11 +19,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import torch
 import torch.nn as nn
 from torch import Tensor
 
 from eml_transformer.models.layers import DecoderLayer
-
 
 VALID_FFN_MODES: tuple[str, ...] = ("vanilla", "delta", "film")
 
@@ -64,7 +64,6 @@ class ModelConfig:
     ffn_expansion: int = 4
     num_bins: int = 6
 
-
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
             raise ValueError(
@@ -73,13 +72,14 @@ class ModelConfig:
         if self.max_seq_len < 1:
             raise ValueError("max_seq_len must be positive")
         if self.ffn_mode not in VALID_FFN_MODES:
-            raise ValueError(
-                f"ffn_mode {self.ffn_mode!r} not in {VALID_FFN_MODES}"
-            )
+            raise ValueError(f"ffn_mode {self.ffn_mode!r} not in {VALID_FFN_MODES}")
         if self.ffn_expansion < 1:
             raise ValueError("ffn_expansion must be >= 1")
         if self.num_bins < 2:
             raise ValueError("num_bins must be >= 2")
+
+
+torch.serialization.add_safe_globals([ModelConfig])
 
 
 def _legacy_self_aware_config(**kwargs) -> dict:
@@ -143,7 +143,6 @@ class TinyDecoder(nn.Module):
                 if getattr(module, "_is_film_gen", False):
                     continue
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
-
 
     def forward(
         self,

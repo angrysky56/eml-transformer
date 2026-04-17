@@ -119,14 +119,13 @@ class EMLTransformer(nn.Module):
         main_config: ModelConfig,
         device: str = "cpu",
         freeze_evaluator: bool = True,
-    ) -> "EMLTransformer":
+    ) -> EMLTransformer:
         """Build an ``EMLTransformer`` by loading an evaluator from disk.
 
         Single ``torch.load`` for both config *and* weights. Uses
-        ``weights_only=False`` because the checkpoint may contain a
-        ``ModelConfig`` dataclass — we trust our own checkpoints.
+        ``weights_only=True`` as ``ModelConfig`` is registered as a safe global.
         """
-        ckpt = torch.load(evaluator_path, map_location=device, weights_only=False)
+        ckpt = torch.load(evaluator_path, map_location=device, weights_only=True)
         eval_config = _coerce_config(ckpt.get("config"))
 
         eval_decoder = TinyDecoder(eval_config)
@@ -137,12 +136,13 @@ class EMLTransformer(nn.Module):
         eval_head.load_state_dict(ckpt["head_state_dict"])
 
         main_decoder = TinyDecoder(main_config)
-        return cls(
+        model = cls(
             evaluator_decoder=eval_decoder,
             evaluator_head=eval_head,
             main_decoder=main_decoder,
             freeze_evaluator=freeze_evaluator,
         )
+        return model.to(device)
 
     def num_trainable_parameters(self) -> int:
         """Parameters that actually receive gradients — excludes frozen evaluator.

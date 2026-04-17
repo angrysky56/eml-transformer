@@ -21,6 +21,8 @@ from eml_transformer.models import (
     TinyDecoder,
     make_config,
 )
+
+torch.serialization.add_safe_globals([ModelConfig])
 from eml_transformer.training import (
     GlobalMeanBaseline,
     TokenClassBaseline,
@@ -160,6 +162,8 @@ def _cmd_train(args: argparse.Namespace) -> int:
         d_model=args.d_model,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
+        ffn_mode=args.ffn_mode,
+        ffn_expansion=args.ffn_expansion,
         num_bins=args.max_depth + 1,
     )
     model = TinyDecoder(m_config)
@@ -190,11 +194,50 @@ def _cmd_train(args: argparse.Namespace) -> int:
 def _cmd_eval(args: argparse.Namespace) -> int:
     """Evaluate a trained model from a checkpoint."""
     tokenizer = EMLTokenizer.from_variables(DEFAULT_VARIABLES)
+
+    # 1. Setup model and config first.
+    if args.load_path:
+        print(f"Loading checkpoint from {args.load_path}...")
+        ckpt = torch.load(args.load_path, map_location=args.device, weights_only=True)
+        raw_cfg = ckpt.get("config")
+        saved_config = make_config(**raw_cfg) if isinstance(raw_cfg, dict) else raw_cfg
+
+        if saved_config is None:
+            print(
+                "Warning: Checkpoint missing config. Falling back to default ModelConfig."
+            )
+            saved_config = ModelConfig()
+
+        # Match the evaluation depth to the model capacity if not explicitly specified
+        # (check if args.max_depth is the default value of 5).
+        if args.max_depth == 5 and saved_config.num_bins != 6:
+            args.max_depth = saved_config.num_bins - 1
+            print(
+                f"Auto-adjusting --max-depth to {args.max_depth} to match checkpoint."
+            )
+
+        model = TinyDecoder(saved_config)
+        head = EffortHead(d_model=saved_config.d_model, num_bins=saved_config.num_bins)
+        load_checkpoint(model, head, args.load_path, device=args.device)
+    else:
+        print("Warning: Evaluating an untrained model (no --load-path provided).")
+        saved_config = ModelConfig(
+            vocab_size=tokenizer.vocab_size,
+            d_model=args.d_model,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            num_bins=args.max_depth + 1,
+        )
+        model = TinyDecoder(saved_config)
+        head = EffortHead(d_model=saved_config.d_model, num_bins=saved_config.num_bins)
+
+    # 2. Setup data using the potentially-updated max_depth.
     eval_ds = EffortDataset(
         tokenizer,
         DEFAULT_VARIABLES,
         args.eval_samples,
         max_depth=args.max_depth,
+        branch_schedule_depth=args.branch_schedule_depth,
         seed=args.seed,
     )
     eval_loader = DataLoader(
@@ -203,22 +246,7 @@ def _cmd_eval(args: argparse.Namespace) -> int:
         collate_fn=lambda b: collate_effort_batch(b, tokenizer.pad_id),
     )
 
-    m_config = ModelConfig(
-        vocab_size=tokenizer.vocab_size,
-        d_model=args.d_model,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-    )
-    model = TinyDecoder(m_config)
-    head = EffortHead(d_model=args.d_model, num_bins=args.max_depth + 1)
-
-    if args.load_path:
-        print(f"Loading checkpoint from {args.load_path}...")
-        load_checkpoint(model, head, args.load_path, device=args.device)
-    else:
-        print("Warning: Evaluating an untrained model (no --load-path provided).")
-
-    print(f"Evaluating model on {args.device}...")
+    print(f"Evaluating model on {args.device} (max_depth={args.max_depth})...")
     metrics = evaluate(model, head, eval_loader, device=args.device)
     pretty_print_metrics(metrics, prefix="Evaluation")
     return 0
@@ -276,8 +304,9 @@ def _cmd_train_main(args: argparse.Namespace) -> int:
         device=args.device,
     )
 
-    # Add LMHead
+    # Add LMHead and ensure the entire model is on the correct device.
     model.task_head = LMHead(d_model=args.d_model, vocab_size=tokenizer.vocab_size)
+    model.to(args.device)
 
     t_config = TrainConfig(
         epochs=args.epochs,
@@ -316,7 +345,7 @@ def _cmd_eval_depth(args: argparse.Namespace) -> int:
 
     # Load checkpoint once to read the saved config (it tells us how to
     # size the head and whether the model was trained at depth 5 or another).
-    ckpt = torch.load(args.load_path, map_location=args.device, weights_only=False)
+    ckpt = torch.load(args.load_path, map_location=args.device, weights_only=True)
     saved_config = ckpt.get("config")
     if isinstance(saved_config, dict):
         saved_config = make_config(**saved_config)
@@ -375,7 +404,7 @@ def _cmd_eval_main(args: argparse.Namespace) -> int:
 
     # ``weights_only=False`` because we saved a ``ModelConfig`` dataclass —
     # our own checkpoints only.
-    checkpoint = torch.load(args.load_path, map_location=args.device, weights_only=False)
+    checkpoint = torch.load(args.load_path, map_location=args.device, weights_only=True)
     raw_cfg = checkpoint["config"]
     m_config = make_config(**raw_cfg) if isinstance(raw_cfg, dict) else raw_cfg
 
@@ -387,13 +416,11 @@ def _cmd_eval_main(args: argparse.Namespace) -> int:
     )
     model.task_head = LMHead(d_model=m_config.d_model, vocab_size=tokenizer.vocab_size)
     model.load_state_dict(checkpoint["model_state_dict"])
+    model.to(args.device)
 
     print(f"Evaluating main model on {args.device}...")
     acc = evaluate_lm(model, eval_loader, device=args.device)
     print(f"Main Decoder LM Accuracy: {acc:.2%}")
-    return 0
-
-
     return 0
 
 
@@ -442,6 +469,13 @@ def _cmd_compare_modes(args: argparse.Namespace) -> int:
         accs: list[float] = []
         maes: list[float] = []
         param_count = 0
+
+        # Calculate expansion for this mode. If --parity is set, we double the
+        # expansion for vanilla/film to match delta's parameter count.
+        eff_expansion = args.ffn_expansion
+        if args.parity and mode in ("vanilla", "film"):
+            eff_expansion *= 2
+
         for seed in args.seeds:
             torch.manual_seed(seed)
             cfg = make_config(
@@ -450,7 +484,7 @@ def _cmd_compare_modes(args: argparse.Namespace) -> int:
                 n_heads=args.n_heads,
                 n_layers=args.n_layers,
                 ffn_mode=mode,
-                ffn_expansion=args.ffn_expansion,
+                ffn_expansion=eff_expansion,
                 num_bins=args.max_depth + 1,
             )
             model = TinyDecoder(cfg)
@@ -464,7 +498,9 @@ def _cmd_compare_modes(args: argparse.Namespace) -> int:
                 device=args.device,
                 verbose=False,
             )
-            print(f"  [{mode} seed={seed}] training ({param_count:,} params)...")
+            print(
+                f"  [{mode} seed={seed}] training ({param_count:,} params, exp={eff_expansion})..."
+            )
             train(model, head, train_loader, eval_loader, t_config)
             metrics = evaluate(model, head, eval_loader, device=args.device)
             accs.append(metrics.accuracy)
@@ -481,10 +517,15 @@ def _cmd_compare_modes(args: argparse.Namespace) -> int:
         r = results[mode]
         accs = torch.tensor(r["accs"])  # type: ignore[arg-type]
         maes = torch.tensor(r["maes"])  # type: ignore[arg-type]
+
+        # Handle single-seed case (std=0 instead of nan)
+        acc_std = accs.std().item() if len(accs) > 1 else 0.0
+        mae_std = maes.std().item() if len(maes) > 1 else 0.0
+
         print(
             f"{mode:<10} {r['params']:>10,}  "
-            f"{accs.mean().item():>10.4%} {accs.std().item():>8.4%} "
-            f"{maes.mean().item():>10.4f} {maes.std().item():>8.4f}"
+            f"{accs.mean().item():>10.4%} {acc_std:>8.4%} "
+            f"{maes.mean().item():>10.4f} {mae_std:>8.4f}"
         )
     return 0
 
@@ -554,6 +595,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     train_parser.add_argument(
+        "--ffn-mode",
+        type=str,
+        default="vanilla",
+        choices=list(VALID_FFN_MODES),
+    )
+    train_parser.add_argument("--ffn-expansion", type=int, default=4)
+    train_parser.add_argument("--branch-schedule-depth", type=int, default=5)
+    train_parser.add_argument(
         "--save-path", type=str, help="Path to save the model checkpoint."
     )
     train_parser.add_argument(
@@ -586,6 +635,12 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     eval_parser.add_argument(
         "--load-path", type=str, help="Path to load a model checkpoint."
+    )
+    eval_parser.add_argument(
+        "--branch-schedule-depth",
+        type=int,
+        default=5,
+        help="Tree distribution schedule (usually match training depth).",
     )
     eval_parser.set_defaults(func=_cmd_eval)
 
@@ -726,8 +781,15 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--n-layers", type=int, default=4)
     compare.add_argument("--max-depth", type=int, default=5)
     compare.add_argument("--ffn-expansion", type=int, default=4)
+    compare.add_argument(
+        "--parity",
+        action="store_true",
+        help="Double FFN expansion for vanilla/film to match delta parameter count.",
+    )
     compare.add_argument("--device", type=str, default="cpu")
-    compare.add_argument("--seed", type=int, default=42, help="Data seed (not run seed).")
+    compare.add_argument(
+        "--seed", type=int, default=42, help="Data seed (not run seed)."
+    )
     compare.set_defaults(func=_cmd_compare_modes)
 
     return parser
