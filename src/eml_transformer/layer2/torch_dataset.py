@@ -31,9 +31,12 @@ class SignatureProgramDataset(Dataset):
                 # Convert complex signature to 12-dim real vector
                 # Convention: [real0, imag0, real1, imag1, ...]
                 sig_tensor = torch.zeros(12, dtype=torch.float32)
+                f_max = torch.finfo(torch.float32).max
                 for i, val in enumerate(p.signature):
-                    sig_tensor[2 * i] = float(val.real)
-                    sig_tensor[2 * i + 1] = float(val.imag)
+                    r_val = float(val.real)
+                    i_val = float(val.imag)
+                    sig_tensor[2 * i] = max(min(r_val, f_max), -f_max)
+                    sig_tensor[2 * i + 1] = max(min(i_val, f_max), -f_max)
 
                 # Store full IDs (with BOS/EOS)
                 full_ids = tokenizer.encode(p.rpn, add_special=True)
