@@ -4,10 +4,10 @@
 **Layer 2: Learned Program Generator**
 
 ## Active Phase
-**Phase 10.1: Data generator module**
+**Phase 10.2: Layer 2 Tokenizer**
 
 ## Milestone Progress
-- [ ] Phase 10.1: Data generator module
+- [x] Phase 10.1: Data generator module
 - [ ] Phase 10.2: Layer 2 Tokenizer
 - [ ] Phase 10.3: PyTorch Dataset & Collation
 - [ ] Phase 10.4: Model Architecture

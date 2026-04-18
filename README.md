@@ -1,50 +1,69 @@
 # eml-transformer
 
-Research prototype for an **effort-gated compiled substrate** inside transformer language models, using EML (exp-minus-log) trees as a verifiable mathematical IR.
+A compiled mathematical substrate for transformer language models. Converts EML (exp-minus-log) expression trees into analytically-constructed transformer weights that compute elementary functions exactly — no training, verifiable to machine precision.
 
-**Status:** Phase 2 Complete. Self-Aware architecture implemented and validated on next-token prediction task.
+**Status:** Layer 1 complete. 27 elementary functions compile and verify to within 10⁻¹² of NumPy reference. Layer 2 (learned program generator) in progress.
 
-## The idea in one paragraph
+## The idea
 
-A transformer forward pass could, in principle, allocate more computation to tokens that "deserve" it. Existing adaptive-computation methods (Mixture-of-Recursions, Mixture-of-Depths) learn this allocation via auxiliary losses with no ground truth signal. This project asks: *what if ground truth existed?* EML-compiled math expressions have an exact per-node tree depth — a provably correct "computational complexity" label. Train a router with that supervision on math-heavy data and you get a learned effort evaluator grounded in something measurable, which can then generalize to arbitrary text.
+Large language models compute elementary math statistically — they predict the tokens that look like the answer. On common inputs this produces the illusion of knowing; on uncommon inputs it fails unpredictably. An LLM has no internal mechanism that *actually computes* sin(x) the way a calculator does.
 
-## Four stacked concepts
+This project builds one. Given that every elementary function reduces to repeated application of a single binary operator `eml(x, y) = exp(x) − ln(y)` (Odrzywołek 2026), and that a transformer's native shape (attention routing + pointwise FFN + residual stream) can analytically express any fixed-schedule program (Moran 2026), we can compile the EML expression for any elementary function directly into transformer weights. The result is a transformer that *runs the computation*, not one that guesses its output.
 
-The long-term architecture stacks four ideas. The Effort Evaluator is the keystone — the other three consume its signal:
+## What's here (Layer 1)
 
-1.  **Effort Evaluator** (Phase 1) — per-token scalar effort score, supervised by EML compilation depth.
-2.  **Self-Aware layer** (Phase 2) — FFN with `W = W_fixed + effort × ΔW_learnable`. At effort=0 the layer computes a proven EML identity exactly; as effort rises the learned delta activates.
-3.  **Spock attention** — attention temperature `τ = 1 − effort`. Low effort stays soft and probabilistic; high effort goes hard and deterministic.
-4.  **Maybe Math** — routing specialization: when effort is high *and* content is math-like, dispatch to a fully compiled EML circuit instead of a general attention layer.
+The compiler takes an RPN expression string from the EML catalog and produces a PyTorch `nn.Module` whose forward pass computes that function on a residual-stream machine:
 
-## What's in this repository
+- **Sequence length** = number of RPN tokens
+- **Layers** = tree depth + 1
+- **Attention** = analytic index-select routing (each EML node reads its two operands from their precomputed positions)
+- **FFN** = the EML operator `exp(a) − ln(b)` applied to the attention output
+- **Parameters** = zero (all weights are analytically set buffers)
 
-- `src/eml_transformer/data/` — EML tree generation, tokenization, and depth labeling.
-- `src/eml_transformer/models/` — Tiny decoder transformer, the **EffortHead** regression module, and the **Self-Aware** decoder.
-- `src/eml_transformer/training/` — Training loops for both Phase 1 (Regression) and Phase 2 (Language Modeling), metrics calculation, and statistical baselines.
-- `src/eml_transformer/cli.py` — Unified entry point for data inspection, baseline fitting, and multi-phase model training.
+```python
+from eml_transformer.compiler import EMLMachine, build_registry, load_catalog, parse_and_expand, compile_tree
 
-## Results: Summary
+# Compile from a library of 27 verified primitives.
+registry = build_registry(load_catalog())
 
-### Phase 1 (Effort Evaluator)
-The Effort Evaluator achieves **100.00% accuracy** on EML depth prediction, significantly outperforming token-class baselines (63.76%). This confirms that hierarchical complexity is fully learnable from linearized RPN context.
+# "x ln sin" → three tokens, machine-epsilon correct sin(ln(x)).
+tree = parse_and_expand("x ln sin", registry)
+machine = EMLMachine(compile_tree(tree))
+machine({"x": 2.0})  # → complex(0.638961276313635 + 0j)
+# math.sin(math.log(2.0)) = 0.638961276313635  — bit-identical.
+```
 
-### Phase 2 (Self-Aware Decoder)
-We evaluated the Self-Aware (SA) architecture against a Non-Self-Aware (NSA) baseline of identical hidden dimension on the next-token prediction task:
+### Verification
 
-| Model | Accuracy (%) | Cross Entropy Loss |
-| :--- | :--- | :--- |
-| **Non-Self-Aware (NSA)** | 56.20% | 1.4881 |
-| **Self-Aware (SA)** | **56.43%** | **1.4811** |
+Every entry in the catalog verifies against its stored six-point transcendental signature to within 10⁻¹²:
 
-The SA model shows a measurable edge in both accuracy and loss, suggesting that the effort-modulated delta-branch effectively utilizes the complexity signal provided by the frozen evaluator.
+```bash
+uv run python -m eml_transformer.compiler.verify
+# catalog verification: 27/27 passed, 0 failed, 0 skipped
+```
+
+Maximum error across the catalog is 1.66×10⁻¹² (on `tan`, a 97-position 24-layer machine). Half the entries are bit-exact.
+
+## What's in the catalog
+
+27 compiled primitives, ranging from `exp` (2 layers, 3 positions, K=3) to `tan` (24 layers, 97 positions, K=97):
+
+- Unary: `exp`, `ln`, `negate`, `reciprocal`, `sin`, `cos`, `tan`, `sinh`, `cosh`, `tanh`, `exp_exp`, `ln_ln`
+- Binary: `add`, `subtract`, `multiply`, `divide`
+- Nullary: `e`, `zero`
+- Plus 9 auto-discovered compositions
+
+The catalog lives in the companion project [`eml-mcp`](https://github.com/angrysky56/eml-mcp) and is loaded as read-only data.
+
+## Directory layout
+
+- `src/eml_transformer/compiler/` — Layer 1. RPN parser, tree composer, compiled machine, verifier.
+- `src/eml_transformer/data/`, `models/`, `training/` — earlier work on effort-gated transformers; see `docs/PHASE2_NULL.md` for why those experiments were superseded.
+- `tests/test_compiler.py` — 19 tests covering RPN parsing, compilation, composition, and verification.
 
 ## Setup
 
-Requires Python 3.12+ and CUDA-capable PyTorch 2.6+.
-
 ```bash
-# Clone and setup environment
 uv venv --python 3.12
 source .venv/bin/activate
 uv sync --extra dev
@@ -52,40 +71,53 @@ uv sync --extra dev
 
 ## Usage
 
-The project follows a two-phase training protocol.
-
-### Phase 1: Train the Effort Evaluator
-Train the router to predict EML depth.
-```bash
-uv run eml-transformer train --save-path evaluator.pt --epochs 10
-```
-
-### Phase 2: Train the Self-Aware Transformer
-Integrate the frozen evaluator and train the language model.
-```bash
-# Train Self-Aware model (default)
-uv run eml-transformer train-main --evaluator-path evaluator.pt --save-path sa_model.pt
-
-# Train Non-Self-Aware baseline for comparison
-uv run eml-transformer train-main --evaluator-path evaluator.pt --save-path nsa_model.pt --no-self-aware
-```
-
-### Evaluation
-```bash
-uv run eml-transformer eval-main --load-path sa_model.pt --evaluator-path evaluator.pt
-```
-
-## Why this may not work (Critical Analysis)
-
-As we move from toy verification to research integration, three primary risks remain:
-
-1.  **Marginal Gains vs. Parameter Count**: The Self-Aware FFN effectively doubles the parameter count for the FFN layers (`W_fixed` + `ΔW`). The 0.23% accuracy gain, while measurable, must be weighed against this overhead. The next logical step is **gated execution**, where the `ΔW` branch is skipped entirely for low-effort tokens to reclaim computational efficiency.
-2.  **Effort Saturation**: If the Effort Evaluator is too accurate (100%), the modulation signal might become too "binary" for the delta branch to learn smooth transitions. We may need to introduce temperature or noise to the effort signal during Phase 2 training.
-3.  **Generalization to Natural Language**: The current dataset is 100% EML math. While the architecture works on this distribution, the "Holy Grail" is generalizing this effort-signal to natural language where "ground truth depth" is not explicitly defined in the training set.
-
-## Testing
+### Verify the catalog
 
 ```bash
-uv run pytest
+uv run python -m eml_transformer.compiler.verify            # summary only
+uv run python -m eml_transformer.compiler.verify --show-all  # full table
+uv run python -m eml_transformer.compiler.verify --only sin cos tan
 ```
-Verification suite covers tree generation, tokenization, model shapes, and checkpoint serialization.
+
+### Compile and evaluate a function
+
+```python
+from eml_transformer.compiler import EMLMachine
+
+# Direct from RPN (no library calls)
+exp_machine = EMLMachine.from_rpn("x 1.0 E")
+exp_machine({"x": 0.5})  # → exp(0.5)
+
+# Via the library
+from eml_transformer.compiler import build_registry, load_catalog, parse_and_expand, compile_tree
+registry = build_registry(load_catalog())
+tree = parse_and_expand("x sin", registry)  # sin called as one token
+sin_machine = EMLMachine(compile_tree(tree))
+sin_machine({"x": 0.5})  # → sin(0.5) to machine epsilon
+```
+
+### Run tests
+
+```bash
+uv run pytest tests/test_compiler.py -v
+```
+
+## What this is not
+
+This is not a general-purpose symbolic math system. The catalog covers elementary functions — polynomials via compositions, exp/log, trig, hyperbolic, and their combinations. It does not cover integration, special functions (Bessel, gamma), linear algebra, or any algorithm requiring unbounded iteration. Extending the substrate to those domains is a separate compilation effort per domain.
+
+This is also not a production inference accelerator. A compiled `tan` machine runs 24 transformer layers to produce one float. NumPy's `tan` runs in nanoseconds. The point is not speed — it's that the transformer's forward pass *is* the computation, available as a callable primitive for a learned agent to use.
+
+## What comes next (Layer 2)
+
+A small learned decoder that, given a description of a target function (either numerical samples or a natural-language reference), emits a short RPN program that the Layer 1 machine verifies to machine precision. Uses the verifier as an oracle reward signal. See `docs/LAYER_2_PLAN.md` for the implementation plan.
+
+## References
+
+- Odrzywołek, A. (2026). *EML as a universal minimal operator for elementary functions.* [arXiv:2603.21852](https://arxiv.org/abs/2603.21852).
+- Moran, S. (2026). *I built a tiny computer inside a transformer.* [Towards Data Science](https://towardsdatascience.com/i-built-a-tiny-computer-inside-a-transformer/) · [transformer-vm code](https://github.com/Percepta-Core/transformer-vm).
+- Companion project: [`angrysky56/eml-mcp`](https://github.com/angrysky56/eml-mcp) — the EML catalog, bootstrapping search, and symbolic verifier.
+
+## License
+
+MIT.

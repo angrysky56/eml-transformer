@@ -3,7 +3,7 @@
 ## Milestone: Learned Program Generator
 
 ### Phase 1: Data Generation & Tokenization
-- [ ] **Phase 10.1: Data generator module**
+- [x] **Phase 10.1: Data generator module**
   - Implement `src/eml_transformer/layer2/dataset.py`.
   - Enumerate RPN programs up to depth 2.
   - Verify with pair count and spot-checks.
