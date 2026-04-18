@@ -4,14 +4,14 @@
 **Layer 2: Learned Program Generator**
 
 ## Active Phase
-**Phase 10.2: Layer 2 Tokenizer**
+**Phase 10.6: (Optional) RL Fine-tuning**
 
 ## Milestone Progress
 - [x] Phase 10.1: Data generator module
-- [ ] Phase 10.2: Layer 2 Tokenizer
-- [ ] Phase 10.3: PyTorch Dataset & Collation
-- [ ] Phase 10.4: Model Architecture
-- [ ] Phase 10.5: Supervised Training Loop
+- [x] Phase 10.2: Layer 2 Tokenizer
+- [x] Phase 10.3: PyTorch Dataset & Collation
+- [x] Phase 10.4: Model Architecture
+- [x] Phase 10.5: Supervised Training Loop
 - [ ] Phase 10.6: (Optional) RL Fine-tuning
 - [ ] Phase 10.7: Evaluation & Documentation
 
