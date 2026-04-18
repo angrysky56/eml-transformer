@@ -8,7 +8,7 @@ if TYPE_CHECKING:
 
 class Layer2Tokenizer:
     """Tokenizer for Layer 2 which treats catalog entries as atomic tokens.
-    
+
     This tokenizer has a fixed vocabulary including:
     - Special tokens: <pad>, <bos>, <eos>, <unk>
     - Variables: x, y, z
@@ -17,7 +17,9 @@ class Layer2Tokenizer:
     - Catalog Names: All entries in the provided catalog.
     """
 
-    def __init__(self, vocab: dict[str, int], catalog: list[CatalogEntry] | None = None):
+    def __init__(
+        self, vocab: dict[str, int], catalog: list[CatalogEntry] | None = None
+    ):
         self._vocab = vocab
         self._id_to_token = {v: k for k, v in vocab.items()}
         self.catalog = catalog or []
@@ -32,25 +34,26 @@ class Layer2Tokenizer:
             "<eos>": 2,
             "<unk>": 3,
         }
-        
+
         # Add variables and fixed atoms
         # Order is deterministic to ensure stable vocab across runs if needed
         fixed_tokens = ["x", "y", "z", "1.0", "E"]
         for token in fixed_tokens:
             if token not in vocab:
                 vocab[token] = len(vocab)
-        
+
         # Add catalog names sorted for stability
         catalog_names = sorted(entry.name for entry in catalog)
         for name in catalog_names:
             if name not in vocab:
                 vocab[name] = len(vocab)
-                
+
         return cls(vocab, catalog)
 
     def parse_to_tree(self, rpn: str):
         """Helper to parse RPN using the tokenizer's catalog."""
-        from eml_transformer.compiler import parse_and_expand, build_registry
+        from eml_transformer.compiler import build_registry, parse_and_expand
+
         if not self.catalog:
             return None
         try:
@@ -65,10 +68,10 @@ class Layer2Tokenizer:
         ids = []
         if add_special:
             ids.append(self.bos_id)
-            
+
         for t in tokens:
             ids.append(self._vocab.get(t, self.unk_id))
-            
+
         if add_special:
             ids.append(self.eos_id)
         return ids

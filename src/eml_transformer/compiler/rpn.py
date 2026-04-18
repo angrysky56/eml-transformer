@@ -32,9 +32,9 @@ error pointing at the offending token.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable
 
 
 class RPNParseError(ValueError):
@@ -53,10 +53,10 @@ class TokenKind(Enum):
     the pure CONST / VAR / EML grammar.
     """
 
-    EML = "eml"        # the operator token "E"
-    CONST = "const"    # a numeric literal (real or complex)
-    VAR = "var"        # a variable name (one of {x, y, z, ...})
-    CALL = "call"      # reference to a named catalog entry (unresolved)
+    EML = "eml"  # the operator token "E"
+    CONST = "const"  # a numeric literal (real or complex)
+    VAR = "var"  # a variable name (one of {x, y, z, ...})
+    CALL = "call"  # reference to a named catalog entry (unresolved)
 
 
 @dataclass(frozen=True)
@@ -212,10 +212,10 @@ class EMLNode:
     kind: TokenKind
     value: complex | None = None
     var_name: str | None = None
-    left: "EMLNode | None" = None
-    right: "EMLNode | None" = None
+    left: EMLNode | None = None
+    right: EMLNode | None = None
     call_name: str | None = None
-    call_args: "tuple[EMLNode, ...] | None" = None
+    call_args: tuple[EMLNode, ...] | None = None
 
     def depth(self) -> int:
         """Maximum subtree depth. Leaves have depth 0.

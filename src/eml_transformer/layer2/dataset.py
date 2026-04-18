@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import cmath
 import itertools
+from collections.abc import Iterable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING
 
 from eml_transformer.compiler import (
     TEST_POINTS,
@@ -43,6 +44,15 @@ class GeneratorConfig:
     seed: int = 0
 
 
+def _collect_vars(node: EMLNode, v_set: set[str]):
+    """Recursively collect variable names from an EML tree."""
+    if node.kind is TokenKind.VAR:
+        v_set.add(node.var_name)  # type: ignore
+    elif node.kind is TokenKind.EML:
+        _collect_vars(node.left, v_set)  # type: ignore
+        _collect_vars(node.right, v_set)  # type: ignore
+
+
 def iter_composition_rpns(
     registry: dict[str, CalleeSpec],
     max_depth: int,
@@ -64,7 +74,7 @@ def iter_composition_rpns(
 
     for d in range(1, max_depth + 1):
         current_depth_rpns: list[str] = []
-        
+
         # We can use any expression from [0...d-1] as an argument,
         # but at least one must be from pool [d-1].
         all_prev_rpns = list(itertools.chain.from_iterable(depth_pools))
@@ -89,7 +99,7 @@ def iter_composition_rpns(
                     rpn = " ".join(args) + f" {name}"
                     yield rpn
                     current_depth_rpns.append(rpn)
-        
+
         depth_pools.append(current_depth_rpns)
 
 
@@ -98,10 +108,7 @@ def _safe_eml(a: complex, b: complex) -> complex:
     # Match machine.py: EXP_CLAMP_MAX = 700.0, EXP_CLAMP_MIN = -700.0
     a_real = max(min(a.real, 700.0), -700.0)
     ea = cmath.exp(complex(a_real, a.imag))
-    if b == 0j:
-        lb = complex(float("-inf"), 0.0)
-    else:
-        lb = cmath.log(b)
+    lb = complex(float("-inf"), 0.0) if b == 0j else cmath.log(b)
     return ea - lb
 
 
@@ -111,7 +118,7 @@ def _evaluate_tree(node: EMLNode, bindings: dict[str, complex]) -> complex:
         return node.value  # type: ignore
     if node.kind is TokenKind.VAR:
         # If var is not in bindings, we fall back to 'x' as per signature_bindings
-        return bindings.get(node.var_name, bindings.get("x", 0j)) # type: ignore
+        return bindings.get(node.var_name, bindings.get("x", 0j))  # type: ignore
     if node.kind is TokenKind.EML:
         left_val = _evaluate_tree(node.left, bindings)  # type: ignore
         right_val = _evaluate_tree(node.right, bindings)  # type: ignore
@@ -122,13 +129,10 @@ def _evaluate_tree(node: EMLNode, bindings: dict[str, complex]) -> complex:
 def generate_pairs(cfg: GeneratorConfig) -> list[SignatureProgramPair]:
     """Generate unique (signature, RPN) pairs based on config."""
     registry = build_registry(load_catalog())
-    
+
     # Filter registry if needed
     if cfg.exclude_entries:
-        registry = {
-            k: v for k, v in registry.items() 
-            if k not in cfg.exclude_entries
-        }
+        registry = {k: v for k, v in registry.items() if k not in cfg.exclude_entries}
 
     # Map from signature key to (rpn, signature)
     deduped: dict[tuple[tuple[float, float], ...], tuple[str, tuple[complex, ...]]] = {}
@@ -138,35 +142,26 @@ def generate_pairs(cfg: GeneratorConfig) -> list[SignatureProgramPair]:
         try:
             # 1. Expand tree
             tree = parse_and_expand(rpn, registry)
-            
-            # 2. Extract variables for stable signature bindings
-            # We can use a simple walk to get variable names
+
             vars_in_tree: set[str] = set()
-            def collect_vars(n: EMLNode):
-                if n.kind is TokenKind.VAR:
-                    vars_in_tree.add(n.var_name)  # type: ignore
-                elif n.kind is TokenKind.EML:
-                    collect_vars(n.left)  # type: ignore
-                    collect_vars(n.right)  # type: ignore
-            collect_vars(tree)
+            _collect_vars(tree, vars_in_tree)
             vars_sorted = tuple(sorted(vars_in_tree))
-            
+
             # 3. Evaluate at test points
             sig_list: list[complex] = []
             for p in TEST_POINTS:
                 bindings = signature_bindings(p, vars_sorted)
                 val = _evaluate_tree(tree, bindings)
                 sig_list.append(val)
-            
+
             signature = tuple(sig_list)
-            
+
             if cfg.unique_signatures_only:
                 # Round for stable comparison (tolerance 10^-10 as per plan)
                 sig_key = tuple(
-                    (round(c.real, 10), round(c.imag, 10)) 
-                    for c in signature
+                    (round(c.real, 10), round(c.imag, 10)) for c in signature
                 )
-                
+
                 if sig_key in deduped:
                     existing_rpn, _ = deduped[sig_key]
                     # Keep shorter RPN, tiebreak lexicographically
@@ -183,9 +178,6 @@ def generate_pairs(cfg: GeneratorConfig) -> list[SignatureProgramPair]:
             continue
 
     if cfg.unique_signatures_only:
-        return [
-            SignatureProgramPair(sig, rpn) 
-            for rpn, sig in deduped.values()
-        ]
+        return [SignatureProgramPair(sig, rpn) for rpn, sig in deduped.values()]
     else:
         return pairs

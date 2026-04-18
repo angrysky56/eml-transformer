@@ -52,15 +52,14 @@ transformers update state, so after layer ``depth(node)`` the value at
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Mapping
 
 import numpy as np
 import torch
 from torch import Tensor, nn
 
 from eml_transformer.compiler.rpn import EMLNode, TokenKind, parse_rpn_to_tree
-
 
 # ---------------------------------------------------------------------------
 # Numerical primitives matching eml-mcp semantics.
@@ -288,18 +287,25 @@ class EMLMachine(nn.Module):
         self.register_buffer("leaf_imag", torch.tensor(leaf_imag))
         self.register_buffer("leaf_mask", torch.tensor(leaf_mask))
 
-
         # Per-layer EML node metadata: at layer l, which positions are EML
         # nodes of depth l, and where do they read their operands from?
         # Stored as three tensors per layer: ``target_pos`` (seq indices
         # receiving the EML result), ``left_pos``, ``right_pos``.
         layers_meta: list[dict[str, Tensor]] = []
         for layer_idx in range(self.config.num_layers):
-            emls_at_depth = [n for n in program.nodes if n.kind is TokenKind.EML and n.depth == layer_idx]
+            emls_at_depth = [
+                n
+                for n in program.nodes
+                if n.kind is TokenKind.EML and n.depth == layer_idx
+            ]
             if emls_at_depth:
-                tgt = torch.tensor([n.position for n in emls_at_depth], dtype=torch.long)
+                tgt = torch.tensor(
+                    [n.position for n in emls_at_depth], dtype=torch.long
+                )
                 lp = torch.tensor([n.left_pos for n in emls_at_depth], dtype=torch.long)
-                rp = torch.tensor([n.right_pos for n in emls_at_depth], dtype=torch.long)
+                rp = torch.tensor(
+                    [n.right_pos for n in emls_at_depth], dtype=torch.long
+                )
             else:
                 tgt = torch.empty(0, dtype=torch.long)
                 lp = torch.empty(0, dtype=torch.long)
@@ -371,16 +377,15 @@ class EMLMachine(nn.Module):
         root_i = i[-1].item()
         return complex(root_r, root_i)
 
-
     @classmethod
-    def from_rpn(cls, rpn: str) -> "EMLMachine":
+    def from_rpn(cls, rpn: str) -> EMLMachine:
         """Construct an :class:`EMLMachine` directly from an RPN string."""
         tree = parse_rpn_to_tree(rpn)
         program = compile_tree(tree)
         return cls(program)
 
     @classmethod
-    def from_program(cls, program: CompiledProgram) -> "EMLMachine":
+    def from_program(cls, program: CompiledProgram) -> EMLMachine:
         """Construct from an already-compiled program (exposed for testing)."""
         return cls(program)
 

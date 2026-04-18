@@ -87,7 +87,9 @@ def verify_entry(
         stored signature for this entry, or the signature length disagrees
         with :data:`TEST_POINTS`).
     """
-    from eml_transformer.compiler.catalog import signature_bindings  # local import to avoid cycle
+    from eml_transformer.compiler.catalog import (  # local import to avoid cycle
+        signature_bindings,
+    )
 
     # Skip gracefully if the catalog doesn't have a valid signature for this row.
     if len(entry.signature) != len(TEST_POINTS):
@@ -245,9 +247,7 @@ def _build_cli() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = _build_cli().parse_args(argv)
     include = set(args.only) if args.only else None
-    results = verify_catalog(
-        db_path=args.db_path, tol=args.tol, include_names=include
-    )
+    results = verify_catalog(db_path=args.db_path, tol=args.tol, include_names=include)
     print(format_summary(results, show_all=args.show_all))
     # Exit code reflects pass/fail for use in scripts and CI.
     any_failed = any((not r.all_passed) and (not r.skipped) for r in results)
